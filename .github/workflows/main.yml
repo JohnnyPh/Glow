@@ -5,7 +5,7 @@ on:
     inputs:
       ipa_url:
         description: "URL to the decrypted IPA file"
-        default: "https://www.dropbox.com/scl/fi/05oyhjimzeidugj7mlbxf/com.facebook.Facebook_522.0.0_und3fined.ipa?rlkey=brenvsalmj7cpvz4sfropzpqn&st=y56utjrj&dl=1"
+        default: "https://www.dropbox.com/scl/fi/8ogmveyu7gxzyuyp3dl37/com.facebook.Messenger_515.0.0_und3fined.ipa?rlkey=a4hq5gxtukdoxu3a19pam4mi9&st=81ji4p9b&dl=1"
         required: true
         type: string
 
