@@ -17,6 +17,11 @@ on:
         default: "com.facebook.Facebook"
         required: true
         type: string
+      create_release:
+        description: "Create a public GitHub release"
+        default: true
+        required: false
+        type: boolean
       upload_to_appdb:
         description: "Upload and Edit Metadata on appdb"
         default: true
@@ -69,7 +74,12 @@ jobs:
 
       - name: Validate downloaded IPA
         run: |
-          file_type=$(file --mime-type -b ${{ github.workspace }}/facebook.ipa)
+          file_path="${{ github.workspace }}/facebook.ipa"
+          if [ ! -f "$file_path" ]; then
+            echo "::error::Download failed: IPA file not found at $file_path"
+            exit 1
+          fi
+          file_type=$(file --mime-type -b "$file_path")
           if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
             echo "::error::Validation failed: The downloaded file is not a valid IPA. Detected type: $file_type."
             exit 1
@@ -93,6 +103,7 @@ jobs:
           api_url="https://api.github.com/repos/dayanch96/Glow/releases/latest"
           response=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "$api_url")
           glow_tag=$(echo "$response" | jq -r '.tag_name')
+          release_body=$(echo "$response" | jq -r '.body')
           deb_url=$(echo "$response" | jq -r '.assets[0].browser_download_url')
           if [[ "$deb_url" == "null" || -z "$deb_url" ]]; then
             echo "::error::Failed to get tweak URL from Github API"
@@ -103,6 +114,9 @@ jobs:
           echo "Extracted Facebook Version: $facebook_version"
           echo "GLOW_TAG=${glow_tag}" >> "$GITHUB_OUTPUT"
           echo "FACEBOOK_VERSION=${facebook_version}" >> "$GITHUB_OUTPUT"
+          echo "release_body<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$release_body" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
           echo "Downloading: $deb_url"
           wget "$deb_url" --no-verbose -O ${{ github.workspace }}/glow_fb.deb
 
@@ -142,4 +156,80 @@ jobs:
           echo "Step 2: Waiting for IPA processing..."
           for i in {1..20}; do
             sleep 15
-            STATUS_
+            STATUS_RESPONSE=$(curl -sS -X POST https://api.dbservices.to/v1.7/get_ipa_analyze_jobs/ -F "lt=${APPDB_LINK_TOKEN}" -F "ids[]=${JOB_ID}")
+            IS_FINISHED=$(echo "$STATUS_RESPONSE" | jq -r '.data[0].is_finished')
+            if [ "$IS_FINISHED" = "1" ]; then
+              echo "Processing finished!"
+              break
+            fi
+            echo "Still processing... Attempt $i of 20."
+            if [ "$i" = "20" ]; then
+              echo "Error: Timeout waiting for IPA processing."
+              exit 1
+            fi
+          done
+          
+          echo "Step 3: Fetching the new IPA ID..."
+          IPA_ID=$(curl -sS -X POST https://api.dbservices.to/v1.7/get_ipas/ -F "lt=${APPDB_LINK_TOKEN}" | jq '(.data | sort_by(.id) | reverse)[0].id')
+          if [ -z "$IPA_ID" ] || [ "$IPA_ID" = "null" ]; then
+            echo "Error: Could not fetch new IPA ID."
+            exit 1
+          fi
+          echo "Found newest IPA ID: ${IPA_ID}"
+          echo "ipa_id=${IPA_ID}" >> "$GITHUB_OUTPUT"
+
+          echo "Step 4: Editing IPA metadata..."
+          APP_NAME="Facebook v${FACEBOOK_VERSION} + Glow ${GLOW_TAG}"
+          curl -sS -X POST https://api.dbservices.to/v1.7/edit_ipa_metadata/ \
+            -F "lt=${APPDB_LINK_TOKEN}" \
+            -F "id=${IPA_ID}" \
+            -F "name=${APP_NAME}" \
+            -F "use_default_tos=1" \
+            -F "use_default_privacy_policy=1" \
+            -F "use_default_license=1" \
+            -F "is_18plus=0" \
+            -F "description=Enhanced Facebook with Glow injected." \
+            -F "whatsnew=Latest Glow update for Facebook." \
+            -F "is_public=1" \
+            -F "source_name=Johnny's library" \
+            -F "developer_name=Meta Platforms, Inc." \
+            -F "genre_name=Enhanced Apps" \
+            -F "min_ios_version=15.0" \
+            -F "min_ipados_version=15.0" \
+            --fail
+          echo "Metadata updated successfully!"
+
+      - name: Cleanup Old Versions
+        if: (github.event_name == 'workflow_dispatch' && inputs.cleanup_old_versions && inputs.upload_to_appdb) || github.event_name == 'schedule'
+        env:
+          APPDB_LINK_TOKEN: ${{ secrets.APPDB_LINK_TOKEN }}
+          NEWEST_IPA_ID: ${{ steps.upload_step.outputs.ipa_id }}
+        run: |
+          echo "Step 5: Cleaning up old IPA versions, keeping ID ${NEWEST_IPA_ID}..."
+          IPAS_RESPONSE=$(curl -sS -X POST https://api.dbservices.to/v1.7/get_ipas/ -F "lt=${APPDB_LINK_TOKEN}")
+          OLD_IPA_IDS=$(echo "$IPAS_RESPONSE" | jq -r --argjson newest_id "$NEWEST_IPA_ID" '(.data | map(select(.name | contains("Facebook") and contains("Glow"))) | map(select(.id != $newest_id)) | .[].id)')
+          if [ -z "$OLD_IPA_IDS" ]; then
+            echo "No old Glow for Facebook versions found to delete."
+          else
+            echo "Found old IPAs to delete with IDs: $OLD_IPA_IDS"
+            for OLD_ID in $OLD_IPA_IDS; do
+              echo "Deleting IPA with ID: $OLD_ID..."
+              curl -sS -X POST https://api.dbservices.to/v1.7/delete_ipa/ \
+                -F "lt=${APPDB_LINK_TOKEN}" \
+                -F "id=${OLD_ID}" \
+                --fail
+              echo "Deleted IPA with ID: $OLD_ID"
+              sleep 2
+            done
+          fi
+          echo "Cleanup finished."
+
+      - name: Create GitHub Release
+        if: (github.event_name == 'workflow_dispatch' && inputs.create_release) || github.event_name == 'schedule'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: glow-fb-${{ steps.versions.outputs.GLOW_TAG }}
+          name: Glow ${{ steps.versions.outputs.GLOW_TAG }} for Facebook v${{ steps.versions.outputs.FACEBOOK_VERSION }}
+          body: ${{ steps.versions.outputs.release_body }}
+          files: ${{ steps.package_info.outputs.package_name }}
+          draft: false
