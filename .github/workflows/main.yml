@@ -4,34 +4,32 @@ on:
   workflow_dispatch:
     inputs:
       ipa_url:
-        description: "URL to the decrypted IPA file"
-        default: "https://www.dropbox.com/scl/fi/8ogmveyu7gxzyuyp3dl37/com.facebook.Messenger_515.0.0_und3fined.ipa?rlkey=a4hq5gxtukdoxu3a19pam4mi9&st=81ji4p9b&dl=1"
-        required: true
+        description: "URL to the decrypted IPA file (bỏ trống nếu muốn tải tự động)"
+        required: false
         type: string
-
       display_name:
         description: "App Name (Optional)"
         default: "Facebook"
         required: true
         type: string
-
       bundle_id:
         description: "BundleID (Optional)"
         default: "com.facebook.Facebook"
         required: true
         type: string
-
       upload_to_appdb:
         description: "Upload and Edit Metadata on appdb"
         default: true
         required: false
         type: boolean
-
       cleanup_old_versions:
         description: "Delete older versions of this app from appdb"
         default: true
         required: false
         type: boolean
+  
+  schedule:
+    - cron: '0 0 * * 0'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -56,14 +54,27 @@ jobs:
         with:
           exclude_inputs: display_name,bundle_id
 
-      - name: Download and validate IPA
+      - name: Download IPA (Auto from App Store)
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.ipa_url == '')
+        uses: JohnnyPh/decryptedappstore-action@main
+        with:
+          appstore_url: "https://apps.apple.com/us/app/facebook/id284882215"
+          path: ${{ github.workspace }}/facebook.ipa
+          token: ${{ secrets.DECRYPTEDAPPSTORE_SESSION_TOKEN }}
+
+      - name: Download IPA (Manual from URL)
+        if: github.event_name == 'workflow_dispatch' && inputs.ipa_url != ''
         run: |
           wget "${{ inputs.ipa_url }}" --no-verbose -O ${{ github.workspace }}/facebook.ipa
+
+      - name: Validate downloaded IPA
+        run: |
           file_type=$(file --mime-type -b ${{ github.workspace }}/facebook.ipa)
           if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
             echo "::error::Validation failed: The downloaded file is not a valid IPA. Detected type: $file_type."
             exit 1
           fi
+          echo "IPA validation successful."
 
       - name: Install Dependencies
         run: brew install make ldid jq
@@ -79,23 +90,19 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Download latest Glow release
           api_url="https://api.github.com/repos/dayanch96/Glow/releases/latest"
           response=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "$api_url")
           glow_tag=$(echo "$response" | jq -r '.tag_name')
           deb_url=$(echo "$response" | jq -r '.assets[0].browser_download_url')
-
           if [[ "$deb_url" == "null" || -z "$deb_url" ]]; then
             echo "::error::Failed to get tweak URL from Github API"
             exit 1
           fi
-          
-          # Extract Facebook version from IPA URL
-          facebook_version=$(echo "${{ inputs.ipa_url }}" | grep -o -E '[0-9]+(\.[0-9]+)+' | head -n 1)
-
+          unzip -p ${{ github.workspace }}/facebook.ipa 'Payload/*.app/Info.plist' > ${{ github.workspace }}/Info.plist
+          facebook_version=$(plutil -p ${{ github.workspace }}/Info.plist | grep '"CFBundleShortVersionString"' | awk -F'"' '{print $4}')
+          echo "Extracted Facebook Version: $facebook_version"
           echo "GLOW_TAG=${glow_tag}" >> "$GITHUB_OUTPUT"
           echo "FACEBOOK_VERSION=${facebook_version}" >> "$GITHUB_OUTPUT"
-          
           echo "Downloading: $deb_url"
           wget "$deb_url" --no-verbose -O ${{ github.workspace }}/glow_fb.deb
 
@@ -117,7 +124,7 @@ jobs:
           mv clean_ipa.ipa "${{ steps.package_info.outputs.package_name }}"
 
       - name: Upload and Edit on appdb
-        if: ${{ inputs.upload_to_appdb }}
+        if: (github.event_name == 'workflow_dispatch' && inputs.upload_to_appdb) || github.event_name == 'schedule'
         id: upload_step
         env:
           APPDB_LINK_TOKEN: ${{ secrets.APPDB_LINK_TOKEN }}
@@ -132,82 +139,7 @@ jobs:
                -F "job_id=${JOB_ID}" \
                -F "ipa=@${PACKAGE_PATH}" \
                --fail
-
           echo "Step 2: Waiting for IPA processing..."
           for i in {1..20}; do
             sleep 15
-            STATUS_RESPONSE=$(curl -sS -X POST https://api.dbservices.to/v1.7/get_ipa_analyze_jobs/ -F "lt=${APPDB_LINK_TOKEN}" -F "ids[]=${JOB_ID}")
-            IS_FINISHED=$(echo "$STATUS_RESPONSE" | jq -r '.data[0].is_finished')
-            if [ "$IS_FINISHED" = "1" ]; then
-              echo "Processing finished!"
-              break
-            fi
-            echo "Still processing... Attempt $i of 20."
-            if [ "$i" = "20" ]; then
-              echo "Error: Timeout waiting for IPA processing."
-              exit 1
-            fi
-          done
-          
-          echo "Step 3: Fetching the new IPA ID..."
-          IPA_ID=$(curl -sS -X POST https://api.dbservices.to/v1.7/get_ipas/ -F "lt=${APPDB_LINK_TOKEN}" | jq '(.data | sort_by(.id) | reverse)[0].id')
-          if [ -z "$IPA_ID" ] || [ "$IPA_ID" = "null" ]; then
-            echo "Error: Could not fetch new IPA ID."
-            exit 1
-          fi
-          echo "Found newest IPA ID: ${IPA_ID}"
-          echo "ipa_id=${IPA_ID}" >> "$GITHUB_OUTPUT"
-
-          echo "Step 4: Editing IPA metadata..."
-          APP_NAME="Facebook v${FACEBOOK_VERSION} + Glow ${GLOW_TAG} | Meta Platforms, Inc."
-          curl -sS -X POST https://api.dbservices.to/v1.7/edit_ipa_metadata/ \
-            -F "lt=${APPDB_LINK_TOKEN}" \
-            -F "id=${IPA_ID}" \
-            -F "name=${APP_NAME}" \
-            -F "use_default_tos=1" \
-            -F "use_default_privacy_policy=1" \
-            -F "use_default_license=1" \
-            -F "is_18plus=0" \
-            -F "description=Enhanced Facebook with Glow injected" \
-            -F "whatsnew=The latest version contains bug fixes and performance improvements." \
-            -F "is_public=1" \
-            -F "source_name=Johnny's library" \
-            -F "developer_name=Meta Platforms, Inc." \
-            -F "genre_name=Enhanced Apps" \
-            -F "min_ios_version=15.0" \
-            -F "min_ipados_version=15.0" \
-            --fail
-          echo "Metadata updated successfully!"
-
-      - name: Cleanup Old Versions on appdb
-        if: ${{ inputs.upload_to_appdb && inputs.cleanup_old_versions }}
-        env:
-          APPDB_LINK_TOKEN: ${{ secrets.APPDB_LINK_TOKEN }}
-          NEWEST_IPA_ID: ${{ steps.upload_step.outputs.ipa_id }}
-        run: |
-          echo "Step 5: Cleaning up old IPA versions, keeping ID ${NEWEST_IPA_ID}..."
-          IPAS_RESPONSE=$(curl -sS -X POST https://api.dbservices.to/v1.7/get_ipas/ -F "lt=${APPDB_LINK_TOKEN}")
-          OLD_IPA_IDS=$(echo "$IPAS_RESPONSE" | jq -r --argjson newest_id "$NEWEST_IPA_ID" '(.data | map(select(.name | contains("Facebook"))) | map(select(.id != $newest_id)) | .[].id)')
-          if [ -z "$OLD_IPA_IDS" ]; then
-            echo "No old Facebook versions found to delete."
-          else
-            echo "Found old IPAs to delete with IDs: $OLD_IPA_IDS"
-            for OLD_ID in $OLD_IPA_IDS; do
-              echo "Deleting IPA with ID: $OLD_ID..."
-              curl -sS -X POST https://api.dbservices.to/v1.7/delete_ipa/ \
-                   -F "lt=${APPDB_LINK_TOKEN}" \
-                   -F "id=${OLD_ID}" \
-                   --fail
-              echo "Deleted IPA with ID: $OLD_ID"
-              sleep 2
-            done
-          fi
-          echo "Cleanup finished."
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: glow-fb-${{ steps.versions.outputs.GLOW_TAG }}
-          name: Glow_FB ${{ steps.versions.outputs.GLOW_TAG }}
-          files: ${{ steps.package_info.outputs.package_name }}
-          draft: true
+            STATUS_
